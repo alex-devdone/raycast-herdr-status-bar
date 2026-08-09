@@ -88,10 +88,13 @@ function load(): { rows: Row[]; hasHerdr: boolean } {
   })();
 
   const agents = listAgents();
-  const rows: Row[] = agents.map((agent) => ({
-    agent,
-    stats: getStats(agent, offsets),
-  }));
+  const rows: Row[] = agents.map((agent) => {
+    try {
+      return { agent, stats: getStats(agent, offsets) };
+    } catch {
+      return { agent }; // one unreadable transcript must not blank all 29 rows
+    }
+  });
 
   // prune offsets to only currently-live claude transcripts, then persist
   const live = new Set(

@@ -322,9 +322,12 @@ function codexRolloutPath(sessionId: string): string | undefined {
   const root = `${HOME}/.codex/sessions`;
   if (!existsSync(root)) return undefined;
   const suffix = `-${sessionId}.jsonl`;
+  // dirs only: codex leaves stray rollout-*.jsonl (and .DS_Store) next to the
+  // YYYY/ dirs, and a stray file sorts first — readdirSync on it throws ENOTDIR.
   const descNum = (dir: string) =>
-    readdirSync(dir)
-      .filter((n) => existsSync(`${dir}/${n}`))
+    readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
       .sort((a, b) => b.localeCompare(a));
   for (const y of descNum(root))
     for (const m of descNum(`${root}/${y}`))
