@@ -5,6 +5,7 @@ import {
   readSync,
   closeSync,
   readdirSync,
+  readFileSync,
   statSync,
 } from "fs";
 import { homedir } from "os";
@@ -18,9 +19,8 @@ export interface Agent {
   cwd: string;
   state: AgentState;
   sessionId?: string; // agent_session.value
-  paneId?: string; // e.g. "w1:p1" — the target `herdr agent focus` takes
-  sock?: string; // socket the agent was found on, needed to focus it
-  seq: number; // state_change_seq — recency tie-break inside a priority bucket
+  terminal?: string; // herdr-core address, e.g. "t12" — what `agent.focus` takes
+  seq: number; // last status change (ms) — recency tie-break, and the activity time when there's no transcript
 }
 
 // herdr's attention queue, verbatim from its tab_attention_priority():
@@ -35,8 +35,6 @@ const ATTENTION: Record<AgentState, number> = {
 
 /** Sort like herdr's agent panel with ui.agent_panel_sort = "priority". */
 export function byPriority(a: Agent, b: Agent): number {
-  // ponytail: seq is per-session, so cross-session ties order arbitrarily —
-  // matches herdr exactly within a session, which is what the panel shows.
   return ATTENTION[b.state] - ATTENTION[a.state] || b.seq - a.seq;
 }
 
@@ -84,73 +82,121 @@ export type ClaudeOffsets = Record<
 const IDLE_GAP_MS = 5 * 60_000;
 
 const HOME = homedir();
-const HERDR = [
-  `${HOME}/.local/bin/herdr`,
-  "/opt/homebrew/bin/herdr",
-  "/usr/local/bin/herdr",
+// Herdr.app runs every terminal in herdr-core (`hc`); the app itself only
+// arranges them. Core answers listing, the app answers focus.
+const CORE = [
+  `${HOME}/.local/bin/herdr-core`,
+  `${HOME}/.local/bin/hc`,
+  "/opt/homebrew/bin/herdr-core",
+].find(existsSync);
+const APP = [
+  `${HOME}/.local/bin/herdr-app`,
+  "/Applications/Herdr.app/Contents/MacOS/Herdr",
 ].find(existsSync);
 
 // --- discovery -------------------------------------------------------------
 
-function normalizeState(s: unknown): AgentState {
+/** herdr-core status → ours. `error` needs a human just like `blocked`. */
+export function normalizeState(s: unknown): AgentState {
+  if (s === "error" || s === "waiting") return "blocked";
+  if (s === "busy") return "working"; // ~/.claude/sessions/<pid>.json says busy/idle
   return s === "working" || s === "idle" || s === "blocked" || s === "done"
     ? s
     : "unknown";
 }
 
-/** All agents across every live herdr session socket, deduped by terminal_id. */
-export function listAgents(): Agent[] {
-  if (!HERDR) return [];
-  const sessionsDir = `${HOME}/.config/herdr/sessions`;
-  if (!existsSync(sessionsDir)) return [];
-  const socks = readdirSync(sessionsDir)
-    .map((d) => `${sessionsDir}/${d}/herdr.sock`)
-    .filter(existsSync);
+// herdr-core names apps by product; the stats dispatch keys off the short name.
+const TYPE: Record<string, string> = { "claude-code": "claude" };
 
-  const seen = new Set<string>();
+function core(args: string): unknown {
+  return JSON.parse(
+    execSync(`${CORE} ${args}`, { timeout: 3000, encoding: "utf-8" }),
+  );
+}
+
+/** Claude Code writes ~/.claude/sessions/<pid>.json: live session id + name. */
+function claudeSession(pid: unknown): {
+  sessionId?: string;
+  name?: string;
+  status?: string;
+  statusUpdatedAt?: number;
+} {
+  if (typeof pid !== "number") return {};
+  try {
+    return JSON.parse(
+      readFileSync(`${HOME}/.claude/sessions/${pid}.json`, "utf-8"),
+    );
+  } catch {
+    return {}; // remote agent, or not claude
+  }
+}
+
+/** Every agent terminal herdr-core knows, this machine's and connected ones'. */
+export function listAgents(): Agent[] {
+  if (!CORE) return [];
+  let terminals: { address: string; status?: string }[];
+  try {
+    terminals = (core("ls --json") as { terminals?: [] }).terminals ?? [];
+  } catch {
+    return []; // core not running
+  }
   const out: Agent[] = [];
-  for (const sock of socks) {
+  // Other machines' agents come back as "machine/tN": state only, since their
+  // transcripts and pids aren't on this disk.
+  for (const { address, status } of terminals) {
+    // A claude typed into a herdr shell reports no status, so local shells get
+    // a look at their foreground process. ponytail: remote shells are skipped —
+    // a `get` over ssh per shell is too slow for a 10s tick.
+    if (!status && address.includes("/")) continue;
     try {
-      const stdout = execSync(`${HERDR} agent list`, {
-        timeout: 3000,
-        encoding: "utf-8",
-        env: { ...process.env, HERDR_SOCKET_PATH: sock },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const t = core(`get ${address} --json`) as any;
+      const fg = basename(t.foreground?.argv?.[0] ?? "");
+      const type = t.status?.app
+        ? (TYPE[t.status.app] ?? t.status.app)
+        : fg === "claude" || fg === "codex"
+          ? fg
+          : undefined;
+      if (!type) continue; // a plain shell
+      const cwd: string = t.foreground?.cwd ?? t.cwd ?? "";
+      const cs = type === "claude" ? claudeSession(t.foreground?.pid) : {};
+      out.push({
+        type,
+        // titles are task names ("Backmerge stage into dev") except a fresh
+        // Claude's generic "Claude Code" — then Claude's session name is better.
+        name:
+          t.name ||
+          // a shell-launched agent's title is just the shell's cwd
+          (t.status && t.title !== "Claude Code" && t.title) ||
+          cs.name ||
+          t.title ||
+          basename(cwd) ||
+          type,
+        cwd,
+        state: normalizeState(t.status?.state ?? cs.status),
+        // ponytail: codex has no pid→session file; its stats stay empty until
+        // herdr-core exposes the session id.
+        sessionId: cs.sessionId,
+        terminal: address,
+        seq: t.status_ms ?? cs.statusUpdatedAt ?? 0,
       });
-      const agents = JSON.parse(stdout)?.result?.agents ?? [];
-      for (const a of agents) {
-        if (!a?.agent) continue; // rows without a detected agent type
-        const tid: string | undefined = a.terminal_id;
-        if (tid && seen.has(tid)) continue;
-        if (tid) seen.add(tid);
-        const cwd: string = a.cwd ?? "";
-        out.push({
-          type: a.agent,
-          name: a.name || basename(cwd) || a.agent,
-          cwd,
-          state: normalizeState(a.agent_status),
-          sessionId: a.agent_session?.value,
-          paneId: a.pane_id,
-          sock,
-          seq: a.state_change_seq ?? 0,
-        });
-      }
     } catch {
-      // dead / stale socket — skip it
+      // terminal ended between ls and get
     }
   }
   return out.sort(byPriority);
 }
 
-/** Focus an agent's pane in herdr. Returns false when it can't be targeted. */
+/** Show an agent in the Herdr window. Returns false when it can't be targeted. */
 export function focusAgent(agent: Agent): boolean {
-  if (!HERDR || !agent.paneId || !agent.sock) return false;
+  if (!APP || !agent.terminal) return false;
   try {
-    const stdout = execSync(`${HERDR} agent focus ${agent.paneId}`, {
+    // exits non-zero with {"error"} when the terminal is gone → catch
+    execSync(`${APP} do agent.focus --terminal ${agent.terminal}`, {
       timeout: 3000,
-      encoding: "utf-8",
-      env: { ...process.env, HERDR_SOCKET_PATH: agent.sock },
     });
-    return !JSON.parse(stdout)?.error; // herdr reports failures in-band, exit 0
+    execSync("open -a Herdr"); // the command shows it; this brings the window forward
+    return true;
   } catch {
     return false;
   }

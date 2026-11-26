@@ -148,7 +148,11 @@ export default function Command() {
 
       {BUCKET_ORDER.map((bucket) => {
         const group = rows.filter(
-          (r) => dateBucket(r.stats?.lastActiveMs, now) === bucket,
+          (r) =>
+            dateBucket(
+              r.stats?.lastActiveMs ?? (r.agent.seq || undefined),
+              now,
+            ) === bucket,
         );
         if (group.length === 0) return null;
         return (

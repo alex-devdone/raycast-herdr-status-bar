@@ -10,6 +10,7 @@ import {
   formatDuration,
   type Agent,
   type AgentState,
+  normalizeState,
 } from "./lib";
 
 // --- dateBucket: Finder-style calendar-day sections ---
@@ -205,6 +206,14 @@ import {
   // missing or unrecognised stored value starts at the first frame
   assert.equal(nextFrame(F, undefined, 0).frame, "yellow.png");
   assert.equal(nextFrame(F, "gone.png:999", 9999).frame, "yellow.png");
+}
+
+// --- herdr-core status ---
+{
+  assert.equal(normalizeState("error"), "blocked");
+  assert.equal(normalizeState("working"), "working");
+  assert.equal(normalizeState("busy"), "working");
+  assert.equal(normalizeState(undefined), "unknown");
 }
 
 // --- formatters ---
