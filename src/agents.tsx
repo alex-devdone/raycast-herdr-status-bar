@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   MenuBarExtra,
   Icon,
@@ -12,6 +13,7 @@ import {
   focusAgent,
   dateBucket,
   nextFrame,
+  formatModel,
   formatTokens,
   formatDuration,
   type Agent,
@@ -22,9 +24,35 @@ import {
 } from "./lib";
 
 const cache = new Cache();
-const OFFSETS_KEY = "claude-offsets-v2"; // v1 entries lack activeMs/lastTs
+const OFFSETS_KEY = "claude-offsets-v3"; // v2 entries lack model
 
 const ALERT_KEY = "alert-frame";
+
+// One value per dimension; unset = show all. Cache, not state: each 10s tick is
+// a fresh process, and the choice must outlive it.
+const FILTER_KEY = "filter";
+interface Filter {
+  agent?: string;
+  model?: string;
+}
+function readFilter(): Filter {
+  try {
+    return JSON.parse(cache.get(FILTER_KEY) ?? "{}");
+  } catch {
+    return {};
+  }
+}
+
+// no local transcript (remote agents, codex) → no model to show
+const modelOf = (r: Row) =>
+  r.stats?.model ? formatModel(r.stats.model) : "unknown";
+
+/** value → row count, most common first */
+function tally(values: string[]): [string, number][] {
+  const m = new Map<string, number>();
+  for (const v of values) m.set(v, (m.get(v) ?? 0) + 1);
+  return [...m].sort((a, b) => b[1] - a[1]);
+}
 
 // Blocked: the logo's backdrop alternates yellow/orange on each 10s tick.
 // Swapping the icon (fixed size) rather than a title glyph is what keeps the
@@ -72,7 +100,7 @@ function stateIcon(state: AgentState) {
 function rowSubtitle(row: Row): string {
   const { agent, stats } = row;
   if (!stats) return `${agent.type} · no local stats`;
-  const parts = [agent.type];
+  const parts = [stats.model ? formatModel(stats.model) : agent.type];
   if (stats.tokens > 0) parts.push(`${formatTokens(stats.tokens)} tok`);
   if (stats.durationMs > 0) parts.push(formatDuration(stats.durationMs));
   return parts.join(" · ");
@@ -111,6 +139,12 @@ function load(): { rows: Row[]; hasHerdr: boolean } {
 }
 
 export default function Command() {
+  const [filter, setFilterState] = useState(readFilter);
+  // Raycast closes the menu on every click; the saved filter shows next open.
+  const setFilter = (f: Filter) => {
+    cache.set(FILTER_KEY, JSON.stringify(f));
+    setFilterState(f);
+  };
   let rows: Row[] = [];
   let hasHerdr = false;
   try {
@@ -119,9 +153,17 @@ export default function Command() {
     // background launches must never throw
   }
 
+  // the title and the blocked blink stay on ALL agents: a filter must not hide an alert
+  const shown = rows.filter(
+    (r) =>
+      (!filter.agent || r.agent.type === filter.agent) &&
+      (!filter.model || modelOf(r) === filter.model),
+  );
+  const filtered = !!(filter.agent || filter.model);
+
   const working = rows.filter((r) => r.agent.state === "working").length;
   const blocked = rows.filter((r) => r.agent.state === "blocked").length;
-  const totalTokens = rows.reduce((n, r) => n + (r.stats?.tokens ?? 0), 0);
+  const totalTokens = shown.reduce((n, r) => n + (r.stats?.tokens ?? 0), 0);
 
   // Blocked needs no count — the coloured logo says it. Working still does,
   // since "how many are running" is the whole point of the menu bar entry.
@@ -146,8 +188,61 @@ export default function Command() {
     >
       {!hasHerdr && <MenuBarExtra.Item title="No herdr sessions found" />}
 
+      {rows.length > 0 && (
+        <MenuBarExtra.Section>
+          <MenuBarExtra.Submenu
+            icon={Icon.Filter}
+            title={
+              filtered
+                ? `Filter: ${[filter.agent, filter.model].filter(Boolean).join(" · ")}`
+                : "Filter"
+            }
+          >
+            <MenuBarExtra.Section title="Agent">
+              {tally(rows.map((r) => r.agent.type)).map(([v, n]) => (
+                <MenuBarExtra.Item
+                  key={`a-${v}`}
+                  icon={filter.agent === v ? Icon.Checkmark : Icon.Circle}
+                  title={v}
+                  subtitle={String(n)}
+                  onAction={() =>
+                    setFilter({
+                      ...filter,
+                      agent: filter.agent === v ? undefined : v,
+                    })
+                  }
+                />
+              ))}
+            </MenuBarExtra.Section>
+            <MenuBarExtra.Section title="Model">
+              {tally(rows.map(modelOf)).map(([v, n]) => (
+                <MenuBarExtra.Item
+                  key={`m-${v}`}
+                  icon={filter.model === v ? Icon.Checkmark : Icon.Circle}
+                  title={v}
+                  subtitle={String(n)}
+                  onAction={() =>
+                    setFilter({
+                      ...filter,
+                      model: filter.model === v ? undefined : v,
+                    })
+                  }
+                />
+              ))}
+            </MenuBarExtra.Section>
+          </MenuBarExtra.Submenu>
+          {filtered && (
+            <MenuBarExtra.Item
+              icon={Icon.XMarkCircle}
+              title="Clear Filters"
+              onAction={() => setFilter({})}
+            />
+          )}
+        </MenuBarExtra.Section>
+      )}
+
       {BUCKET_ORDER.map((bucket) => {
-        const group = rows.filter(
+        const group = shown.filter(
           (r) =>
             dateBucket(
               r.stats?.lastActiveMs ?? (r.agent.seq || undefined),
@@ -179,7 +274,7 @@ export default function Command() {
         <MenuBarExtra.Section>
           <MenuBarExtra.Item
             icon={Icon.BarChart}
-            title={`${rows.length} agents · ${working} working · ${blocked} blocked`}
+            title={`${filtered ? `${shown.length} of ${rows.length}` : rows.length} agents · ${working} working · ${blocked} blocked`}
             subtitle={
               totalTokens > 0 ? `Σ ${formatTokens(totalTokens)} tok` : undefined
             }

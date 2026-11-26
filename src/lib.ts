@@ -42,6 +42,7 @@ export interface Stats {
   tokens: number; // headline usage total (see per-type notes below)
   durationMs: number; // session activity span
   lastActiveMs: number; // transcript/rollout mtime — the "date modified" we bucket by
+  model?: string; // latest model the agent replied with, e.g. "claude-opus-5-5"
 }
 
 // Finder-style date buckets, keyed off last activity, plus rolling 1h/5h windows on top.
@@ -74,6 +75,7 @@ export type ClaudeOffsets = Record<
     cacheCreate: number;
     activeMs: number;
     lastTs: number;
+    model?: string;
   }
 >;
 
@@ -221,6 +223,7 @@ export function parseClaudeUsage(
   consumed: number;
   activeMs: number;
   lastTs: number;
+  model?: string;
 } {
   const lastNl = text.lastIndexOf("\n");
   if (lastNl < 0)
@@ -237,7 +240,8 @@ export function parseClaudeUsage(
     tout = 0,
     cc = 0,
     activeMs = 0,
-    prev = prevTs;
+    prev = prevTs,
+    model: string | undefined;
   for (const line of complete.split("\n")) {
     if (!line) continue;
     try {
@@ -248,6 +252,8 @@ export function parseClaudeUsage(
         tout += u.output_tokens || 0;
         cc += u.cache_creation_input_tokens || 0;
       }
+      const m = entry?.message?.model;
+      if (m && m !== "<synthetic>") model = m; // last reply wins — /model switches mid-session
       const t = entry?.timestamp ? Date.parse(entry.timestamp) : NaN;
       if (!Number.isNaN(t)) {
         const delta = t - prev;
@@ -265,6 +271,7 @@ export function parseClaudeUsage(
     consumed: Buffer.byteLength(complete),
     activeMs,
     lastTs: prev,
+    model,
   };
 }
 
@@ -350,6 +357,7 @@ function claudeStats(
       cacheCreate: base.cacheCreate + p.cacheCreate,
       activeMs: base.activeMs + p.activeMs,
       lastTs: p.lastTs,
+      model: p.model ?? base.model,
     };
   }
 
@@ -361,6 +369,7 @@ function claudeStats(
     // transcript on load, so a 40h-cold session can look touched a minute ago.
     // The last real message timestamp is the only honest activity signal.
     lastActiveMs: c.lastTs || st.mtimeMs,
+    model: c.model,
   };
 }
 
@@ -460,6 +469,15 @@ export function nextFrame(
 }
 
 // --- formatting ------------------------------------------------------------
+
+/** "claude-opus-5-5" → "opus 5.5", "claude-haiku-4-5-20251001" → "haiku 4.5". */
+export function formatModel(id: string): string {
+  return id
+    .replace(/^claude-/, "")
+    .replace(/-\d{8}$/, "")
+    .replace(/-(\d+)-(\d+)$/, " $1.$2")
+    .replace(/-(\d+)$/, " $1");
+}
 
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;

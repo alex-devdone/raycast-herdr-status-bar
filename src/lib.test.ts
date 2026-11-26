@@ -11,6 +11,7 @@ import {
   type Agent,
   type AgentState,
   normalizeState,
+  formatModel,
 } from "./lib";
 
 // --- dateBucket: Finder-style calendar-day sections ---
@@ -214,6 +215,22 @@ import {
   assert.equal(normalizeState("working"), "working");
   assert.equal(normalizeState("busy"), "working");
   assert.equal(normalizeState(undefined), "unknown");
+}
+
+// --- model: last real reply wins, <synthetic> ignored, survives chunks w/o one ---
+{
+  const l = (model: string) => JSON.stringify({ message: { model } }) + "\n";
+  assert.equal(
+    parseClaudeUsage(
+      l("claude-opus-5") + l("claude-opus-5-5") + l("<synthetic>"),
+    ).model,
+    "claude-opus-5-5",
+  );
+  assert.equal(parseClaudeUsage('{"type":"user"}\n').model, undefined);
+  assert.equal(formatModel("claude-opus-5-5"), "opus 5.5");
+  assert.equal(formatModel("claude-haiku-4-5-20251001"), "haiku 4.5");
+  assert.equal(formatModel("claude-opus-5"), "opus 5");
+  assert.equal(formatModel("opus"), "opus");
 }
 
 // --- formatters ---
